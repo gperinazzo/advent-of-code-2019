@@ -121,7 +121,22 @@ fn run_intcode(input: &mut [usize]) -> Result<(), IntCodeError> {
 }
 
 fn main() {
-    let mut input = read_input().expect("Invalid puzzle input");
-    run_intcode(&mut input).unwrap();
-    println!("First position: {}", input[0]);
+    let input = read_input().expect("Invalid puzzle input");
+    let mut input_clone = input.clone();
+    run_intcode(&mut input_clone).unwrap();
+    println!("Puzzle 1 - First position: {}", input_clone[0]);
+
+    for noun in 0..=99 {
+        for verb in 0..=99 {
+            let mut input = input.clone();
+            input[1] = noun;
+            input[2] = verb;
+            run_intcode(&mut input).unwrap();
+            if input[0] == 19690720 {
+                println!("Found noun {}, verb {}", noun, verb);
+                println!("Puzzle 2 - Result: {}", 100 * noun + verb);
+                return;
+            }
+        }
+    }
 }
