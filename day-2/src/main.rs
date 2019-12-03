@@ -37,63 +37,92 @@ impl fmt::Display for IntCodeError {
 
 impl std::error::Error for IntCodeError {}
 
-enum Command {
+enum OpCode {
     Add = 1,
     Multiply = 2,
     Exit = 99,
 }
 
-impl TryFrom<usize> for Command {
-    type Error = IntCodeError;
-    fn try_from(value: usize) -> Result<Self, IntCodeError> {
-        match value {
-            1 => Ok(Command::Add),
-            2 => Ok(Command::Multiply),
-            99 => Ok(Command::Exit),
-            _ => Err(IntCodeError::InvalidOpCode(value)),
+impl OpCode {
+    fn num_args(&self) -> usize {
+        match self {
+            OpCode::Add => 3,
+            OpCode::Multiply => 3,
+            OpCode::Exit => 0,
         }
     }
 }
 
-enum Operation {
+impl TryFrom<&usize> for OpCode {
+    type Error = IntCodeError;
+    fn try_from(value: &usize) -> Result<Self, IntCodeError> {
+        match value {
+            1 => Ok(OpCode::Add),
+            2 => Ok(OpCode::Multiply),
+            99 => Ok(OpCode::Exit),
+            _ => Err(IntCodeError::InvalidOpCode(*value)),
+        }
+    }
+}
+
+enum Command {
     Add(usize, usize, usize),
     Multiply(usize, usize, usize),
     Stop,
 }
 
 impl Command {
-    fn read_next(array: &[usize], position: usize) -> Result<usize, IntCodeError> {
-        if array.len() > position + 1 {
-            Ok(array[position])
-        } else {
+    fn from_op_code<'a, I>(op: &OpCode, iterator: &mut I) -> Result<Command, IntCodeError>
+    where
+        I: Iterator<Item = &'a usize>,
+    {
+        let len = op.num_args();
+        let args = Command::read_args(iterator, len)?;
+        let command = match op {
+            OpCode::Add => Command::Add(args[0], args[1], args[2]),
+            OpCode::Multiply => Command::Multiply(args[0], args[1], args[2]),
+            OpCode::Exit => Command::Stop,
+        };
+        Ok(command)
+    }
+
+    fn read_next<'a, I>(iterator: &mut I) -> Result<&'a usize, IntCodeError>
+    where
+        I: Iterator<Item = &'a usize>,
+    {
+        iterator.next().ok_or(IntCodeError::UnexpectedEndOfFile)
+    }
+
+    fn read_args<'a, I>(iterator: &mut I, num: usize) -> Result<Vec<usize>, IntCodeError>
+    where
+        I: Iterator<Item = &'a usize>,
+    {
+        let values = iterator.take(num).cloned().collect::<Vec<usize>>();
+
+        if values.len() < num {
             Err(IntCodeError::UnexpectedEndOfFile)
+        } else {
+            Ok(values)
         }
     }
 
-    fn read_args(array: &[usize], position: usize) -> Result<(usize, usize, usize), IntCodeError> {
-        if array.len() > position + 3 {
-            Ok((array[position], array[position + 1], array[position + 2]))
-        } else {
-            Err(IntCodeError::UnexpectedEndOfFile)
-        }
+    pub fn read_command<'a, I>(iterator: &mut I) -> Result<(usize, Command), IntCodeError>
+    where
+        I: Iterator<Item = &'a usize>,
+    {
+        let op_code: OpCode = Command::read_next(iterator)?.try_into()?;
+        let command = Command::from_op_code(&op_code, iterator)?;
+        Ok((op_code.num_args() + 1, command))
     }
 
-    pub fn read_command(
-        array: &[usize],
-        position: usize,
-    ) -> Result<(usize, Operation), IntCodeError> {
-        let command: Command = Command::read_next(array, position)?.try_into()?;
-        let position = position + 1;
-
-        match command {
-            Command::Exit => Ok((1, Operation::Stop)),
-            Command::Add => {
-                let args = Command::read_args(array, position)?;
-                Ok((4, Operation::Add(args.0, args.1, args.2)))
+    pub fn execute(&self, memory: &mut [usize]) {
+        match self {
+            Command::Stop => return,
+            Command::Add(x, y, result) => {
+                memory[*result] = memory[*x] + memory[*y];
             }
-            Command::Multiply => {
-                let args = Command::read_args(array, position)?;
-                Ok((4, Operation::Multiply(args.0, args.1, args.2)))
+            Command::Multiply(x, y, result) => {
+                memory[*result] = memory[*x] * memory[*y];
             }
         }
     }
@@ -106,17 +135,14 @@ fn run_intcode(input: &mut [usize]) -> Result<(), IntCodeError> {
         if instruction_pointer > length {
             return Err(IntCodeError::UnexpectedEndOfFile);
         }
-        match Command::read_command(&input, instruction_pointer)? {
-            (_, Operation::Stop) => return Ok(()),
-            (advance, Operation::Add(x, y, result)) => {
-                input[result] = input[x] + input[y];
-                instruction_pointer += advance;
-            }
-            (advance, Operation::Multiply(x, y, result)) => {
-                input[result] = input[x] * input[y];
-                instruction_pointer += advance;
-            }
+        let (advance, command) =
+            Command::read_command(&mut input[instruction_pointer..].into_iter())?;
+        if let Command::Stop = command {
+            return Ok(());
         }
+
+        command.execute(input);
+        instruction_pointer += advance;
     }
 }
 
