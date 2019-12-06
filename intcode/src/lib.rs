@@ -15,6 +15,8 @@ pub enum IntCodeError {
     InvalidAddress,
     ImmediateModeOutput,
     UnexpectedEndOfFile,
+    IoError(std::io::Error),
+    ParseError(std::num::ParseIntError),
 }
 
 type Result<T, E = IntCodeError> = std::result::Result<T, E>;
@@ -27,6 +29,8 @@ impl fmt::Display for IntCodeError {
                 write!(f, "Invalid Parameter Mode found: {}", code)
             }
             IntCodeError::InvalidAddress => write!(f, "Found invalid address"),
+            IntCodeError::IoError(err) => write!(f, "IO error: {}", err),
+            IntCodeError::ParseError(err) => write!(f, "Parse error: {}", err),
             IntCodeError::UnexpectedEndOfFile => write!(f, "Unexpected end of file"),
             IntCodeError::ImmediateModeOutput => {
                 write!(f, "Instruction was set to output in immediate mode")
@@ -38,6 +42,18 @@ impl fmt::Display for IntCodeError {
 impl From<TryFromIntError> for IntCodeError {
     fn from(_: TryFromIntError) -> Self {
         IntCodeError::InvalidAddress
+    }
+}
+
+impl From<std::io::Error> for IntCodeError {
+    fn from(err: std::io::Error) -> Self {
+        IntCodeError::IoError(err)
+    }
+}
+
+impl From<std::num::ParseIntError> for IntCodeError {
+    fn from(err: std::num::ParseIntError) -> Self {
+        IntCodeError::ParseError(err)
     }
 }
 
@@ -53,6 +69,10 @@ enum OpCode {
     Multiply(ParameterMode, ParameterMode, ParameterMode),
     Input(ParameterMode),
     Output(ParameterMode),
+    JumpIfTrue(ParameterMode, ParameterMode),
+    JumpIfFalse(ParameterMode, ParameterMode),
+    LessThan(ParameterMode, ParameterMode, ParameterMode),
+    Equals(ParameterMode, ParameterMode, ParameterMode),
     Exit,
 }
 
@@ -74,6 +94,10 @@ impl OpCode {
             OpCode::Multiply(..) => 3,
             OpCode::Input(..) => 1,
             OpCode::Output(..) => 1,
+            OpCode::JumpIfTrue(..) => 2,
+            OpCode::JumpIfFalse(..) => 2,
+            OpCode::LessThan(..) => 3,
+            OpCode::Equals(..) => 3,
             OpCode::Exit => 0,
         }
     }
@@ -99,6 +123,10 @@ impl TryFrom<&Value> for OpCode {
             2 => Ok(OpCode::Multiply(params!(1), params!(2), params!(3))),
             3 => Ok(OpCode::Input(params!(1))),
             4 => Ok(OpCode::Output(params!(1))),
+            5 => Ok(OpCode::JumpIfTrue(params!(1), params!(2))),
+            6 => Ok(OpCode::JumpIfFalse(params!(1), params!(2))),
+            7 => Ok(OpCode::LessThan(params!(1), params!(2), params!(3))),
+            8 => Ok(OpCode::Equals(params!(1), params!(2), params!(3))),
             99 => Ok(OpCode::Exit),
             _ => Err(IntCodeError::InvalidOpCode(*value)),
         }
@@ -136,6 +164,10 @@ enum Command {
     Multiply(Parameter, Parameter, Parameter),
     Input(Parameter),
     Output(Parameter),
+    JumpIfTrue(Parameter, Parameter),
+    JumpIfFalse(Parameter, Parameter),
+    LessThan(Parameter, Parameter, Parameter),
+    Equals(Parameter, Parameter, Parameter),
     Stop,
 }
 
@@ -183,6 +215,54 @@ impl Command {
                 mode: m1,
                 value: args[0],
             }),
+            OpCode::JumpIfTrue(m1, m2) => Command::JumpIfTrue(
+                Parameter {
+                    mode: m1,
+                    value: args[0],
+                },
+                Parameter {
+                    mode: m2,
+                    value: args[1],
+                },
+            ),
+            OpCode::JumpIfFalse(m1, m2) => Command::JumpIfFalse(
+                Parameter {
+                    mode: m1,
+                    value: args[0],
+                },
+                Parameter {
+                    mode: m2,
+                    value: args[1],
+                },
+            ),
+            OpCode::LessThan(m1, m2, m3) => Command::LessThan(
+                Parameter {
+                    mode: m1,
+                    value: args[0],
+                },
+                Parameter {
+                    mode: m2,
+                    value: args[1],
+                },
+                Parameter {
+                    mode: m3,
+                    value: args[2],
+                },
+            ),
+            OpCode::Equals(m1, m2, m3) => Command::Equals(
+                Parameter {
+                    mode: m1,
+                    value: args[0],
+                },
+                Parameter {
+                    mode: m2,
+                    value: args[1],
+                },
+                Parameter {
+                    mode: m3,
+                    value: args[2],
+                },
+            ),
             OpCode::Exit => Command::Stop,
         };
         Ok(command)
@@ -223,13 +303,13 @@ impl Command {
         memory: &mut [Value],
         mut input: In,
         mut output: Out,
-    ) -> Result<()>
+    ) -> Result<Option<usize>>
     where
         In: BufRead,
         Out: Write,
     {
         match self {
-            Command::Stop => return Ok(()),
+            Command::Stop => return Ok(None),
             Command::Add(x, y, result) => {
                 result.set(x.get(memory)? + y.get(memory)?, memory)?;
             }
@@ -238,15 +318,39 @@ impl Command {
             }
             Command::Input(address) => {
                 let mut line = String::new();
-                input.read_line(&mut line).unwrap();
-                let value: Value = line.parse().unwrap();
+                input.read_line(&mut line)?;
+                let value: Value = line.trim().parse()?;
                 address.set(value, memory)?;
             }
             Command::Output(address) => {
-                write!(output, "{}\n", address.get(memory)?).unwrap();
+                write!(output, "{}\n", address.get(memory)?)?;
+            }
+            Command::LessThan(x, y, result) => {
+                if x.get(memory)? < y.get(memory)? {
+                    result.set(1, memory)?;
+                } else {
+                    result.set(0, memory)?;
+                }
+            }
+            Command::Equals(x, y, result) => {
+                if x.get(memory)? == y.get(memory)? {
+                    result.set(1, memory)?;
+                } else {
+                    result.set(0, memory)?;
+                }
+            }
+            Command::JumpIfTrue(cond, address) => {
+                if cond.get(memory)? != 0 {
+                    return Ok(Some(address.get(memory)?.try_into()?));
+                }
+            }
+            Command::JumpIfFalse(cond, address) => {
+                if cond.get(memory)? == 0 {
+                    return Ok(Some(address.get(memory)?.try_into()?));
+                }
             }
         }
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -267,8 +371,11 @@ where
             return Ok(output);
         }
 
-        command.execute(memory, &mut input, &mut output)?;
-        instruction_pointer += advance;
+        if let Some(jump) = command.execute(memory, &mut input, &mut output)? {
+            instruction_pointer = jump;
+        } else {
+            instruction_pointer += advance;
+        }
     }
 }
 
@@ -338,7 +445,7 @@ mod test {
     }
     #[test]
     fn test_case_6() {
-        let buffer: &[u8] = "99".as_bytes();
+        let buffer: &[u8] = b"99";
         let mut input = vec![3, 2, 0];
         run_intcode(&mut input, BufReader::new(buffer), Cursor::new(vec![]))
             .expect("Expect to work");
@@ -346,11 +453,19 @@ mod test {
     }
     #[test]
     fn test_case_7() {
-        let buffer: &[u8] = &[];
-        let mut input = vec![4, 3, 99, 1];
+        let buffer: &[u8] = b"0";
+        let mut input = vec![3, 12, 6, 12, 15, 1, 13, 14, 13, 4, 13, 99, -1, 0, 1, 9];
         let output = run_intcode(&mut input, BufReader::new(buffer), Cursor::new(vec![]))
             .expect("Expect to work");
-        assert_eq!(input[..], [4, 3, 99, 1]);
-        assert_eq!(&output.into_inner()[..], "1\n".as_bytes())
+        assert_eq!(&output.into_inner()[..], "0\n".as_bytes())
+    }
+
+    #[test]
+    fn test_case_8() {
+        let buffer: &[u8] = b"0";
+        let mut input = vec![3, 3, 1105, -1, 9, 1101, 0, 0, 12, 4, 12, 99, 1];
+        let output = run_intcode(&mut input, BufReader::new(buffer), Cursor::new(vec![]))
+            .expect("Expect to work");
+        assert_eq!(&output.into_inner()[..], "0\n".as_bytes())
     }
 }
