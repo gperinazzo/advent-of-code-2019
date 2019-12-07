@@ -15,8 +15,35 @@ fn read_orbits() -> HashMap<String, String> {
         .collect()
 }
 
-fn main() {
-    let input = read_orbits();
+struct PathIterator<'a> {
+    graph: &'a HashMap<String, String>,
+    current: &'a str,
+}
+
+impl<'a> Iterator for PathIterator<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.graph.get(self.current) {
+            Some(value) => {
+                self.current = value;
+                Some(value.as_str())
+            }
+            None => None,
+        }
+    }
+}
+
+impl<'a> PathIterator<'a> {
+    fn new(graph: &'a HashMap<String, String>, initial: &'a str) -> Self {
+        Self {
+            graph,
+            current: initial,
+        }
+    }
+}
+
+fn orbit_count_checksum(input: &HashMap<String, String>) -> u32 {
     let mut orbits_map: HashMap<String, u32> = HashMap::with_capacity(input.len());
     for (key, value) in input.iter() {
         if orbits_map.contains_key(key) {
@@ -46,5 +73,25 @@ fn main() {
         }
     }
 
-    println!("Puzzle 1- {}", orbits_map.values().sum::<u32>());
+    orbits_map.values().sum::<u32>()
+}
+
+fn jumps_to_santa(input: &HashMap<String, String>) -> Option<u32> {
+    let your_path: HashMap<&str, usize> = PathIterator::new(input, "YOU")
+        .enumerate()
+        .map(|(index, key)| (key, index))
+        .collect();
+
+    PathIterator::new(input, "SAN")
+        .enumerate()
+        .find_map(|(index, key)| your_path.get(key).map(|value| *value as u32 + index as u32))
+}
+
+fn main() {
+    let input = read_orbits();
+    println!("Puzzle 1: {}", orbit_count_checksum(&input));
+    match jumps_to_santa(&input) {
+        Some(value) => println!("Puzzle 2: {}", value),
+        None => println!("Puzzle 2: no solution found"),
+    };
 }
