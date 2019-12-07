@@ -43,37 +43,29 @@ impl<'a> PathIterator<'a> {
     }
 }
 
-fn orbit_count_checksum(input: &HashMap<String, String>) -> u32 {
-    let mut orbits_map: HashMap<String, u32> = HashMap::with_capacity(input.len());
-    for (key, value) in input.iter() {
+fn orbit_count_checksum(input: &HashMap<String, String>) -> usize {
+    let mut orbits_map: HashMap<String, usize> = HashMap::with_capacity(input.len() + 1);
+    orbits_map.insert("COM".to_string(), 0);
+    for key in input.keys() {
         if orbits_map.contains_key(key) {
             continue;
         }
-        let mut stack: Vec<&String> = Vec::new();
-        let mut current_key = key;
-        let mut current_value = value;
-        let mut steps;
-        loop {
-            if current_value == "COM" {
-                steps = 1;
-                break;
-            } else if let Some(value_steps) = orbits_map.get(current_value).clone() {
-                steps = value_steps + 1;
+        let mut stack: Vec<&str> = vec![key];
+        let mut steps = 0;
+        for obj in PathIterator::new(input, key.as_str()) {
+            if let Some(value) = orbits_map.get(obj) {
+                steps = *value;
                 break;
             }
-            stack.push(current_key);
-            current_key = current_value;
-            current_value = input.get(current_key).unwrap();
+            stack.push(obj);
         }
 
-        orbits_map.insert(current_key.clone(), steps);
-        for key in stack.drain(..).rev() {
-            steps += 1;
-            orbits_map.insert(key.clone(), steps);
+        for (index, key) in stack.drain(..).rev().enumerate() {
+            orbits_map.insert(key.to_string(), steps + index + 1);
         }
     }
 
-    orbits_map.values().sum::<u32>()
+    orbits_map.values().sum()
 }
 
 fn jumps_to_santa(input: &HashMap<String, String>) -> Option<u32> {
