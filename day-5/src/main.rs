@@ -1,9 +1,15 @@
-use intcode::{read_intcode_input, run_intcode};
+use intcode::{read_intcode_input, IntCodeMachine};
 use std::fs::File;
-use std::io::{stdin, stdout, BufReader};
+use std::io::BufReader;
 
 fn main() {
     let file = BufReader::new(File::open("./input.txt").unwrap());
-    let mut input = read_intcode_input(file).expect("Invalid puzzle input");
-    run_intcode(&mut input, stdin().lock(), stdout().lock()).unwrap();
+    let memory = read_intcode_input(file).expect("Invalid puzzle input");
+    let mut machine = IntCodeMachine::new(memory.clone());
+    let output = machine.execute(vec![1]).unwrap();
+    println!("Puzzle 1 - {:?}", output);
+
+    let mut machine = IntCodeMachine::new(memory.clone());
+    let output = machine.execute(vec![5]).unwrap();
+    println!("Puzzle 2 - {:?}", output);
 }

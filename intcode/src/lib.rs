@@ -1,12 +1,73 @@
 use std::boxed::Box;
 use std::convert::{From, TryFrom, TryInto};
 use std::fmt;
-use std::io::{BufRead, Write};
+use std::io::BufRead;
 use std::num::TryFromIntError;
 
 type ParseError = Box<dyn std::error::Error>;
 
 type Value = isize;
+
+pub struct Pipe<M1, M2> {
+    first: M1,
+    second: M2,
+}
+
+impl<M1: Clone, M2: Clone> Clone for Pipe<M1, M2> {
+    fn clone(&self) -> Self {
+        Self {
+            first: self.first.clone(),
+            second: self.second.clone(),
+        }
+    }
+}
+
+pub trait Machine {
+    fn execute(&mut self, input: Vec<Value>) -> Result<Vec<Value>>;
+    fn finished(&self) -> bool;
+
+    fn pipe<T: Machine>(self, other: T) -> Pipe<Self, T>
+    where
+        Self: Sized,
+    {
+        Pipe {
+            first: self,
+            second: other,
+        }
+    }
+}
+
+impl<T1, T2> Pipe<T1, T2> {
+    pub fn new(first: T1, second: T2) -> Self {
+        Self { first, second }
+    }
+}
+
+impl<M1, M2> Machine for Pipe<M1, M2>
+where
+    M1: Machine,
+    M2: Machine,
+{
+    fn execute(&mut self, input: Vec<Value>) -> Result<Vec<Value>> {
+        let out = self.first.execute(input)?;
+        self.second.execute(out)
+    }
+
+    fn finished(&self) -> bool {
+        self.first.finished() || self.second.finished()
+    }
+}
+
+impl Machine for Pipe<Box<dyn Machine>, Box<dyn Machine>> {
+    fn execute(&mut self, input: Vec<Value>) -> Result<Vec<Value>> {
+        let out = self.first.execute(input)?;
+        self.second.execute(out)
+    }
+
+    fn finished(&self) -> bool {
+        self.first.finished() || self.second.finished()
+    }
+}
 
 #[derive(Debug)]
 pub enum IntCodeError {
@@ -15,8 +76,7 @@ pub enum IntCodeError {
     InvalidAddress,
     ImmediateModeOutput,
     UnexpectedEndOfFile,
-    IoError(std::io::Error),
-    ParseError(std::num::ParseIntError),
+    InputError,
 }
 
 type Result<T, E = IntCodeError> = std::result::Result<T, E>;
@@ -29,8 +89,7 @@ impl fmt::Display for IntCodeError {
                 write!(f, "Invalid Parameter Mode found: {}", code)
             }
             IntCodeError::InvalidAddress => write!(f, "Found invalid address"),
-            IntCodeError::IoError(err) => write!(f, "IO error: {}", err),
-            IntCodeError::ParseError(err) => write!(f, "Parse error: {}", err),
+            IntCodeError::InputError => write!(f, "Expected input, found none"),
             IntCodeError::UnexpectedEndOfFile => write!(f, "Unexpected end of file"),
             IntCodeError::ImmediateModeOutput => {
                 write!(f, "Instruction was set to output in immediate mode")
@@ -42,18 +101,6 @@ impl fmt::Display for IntCodeError {
 impl From<TryFromIntError> for IntCodeError {
     fn from(_: TryFromIntError) -> Self {
         IntCodeError::InvalidAddress
-    }
-}
-
-impl From<std::io::Error> for IntCodeError {
-    fn from(err: std::io::Error) -> Self {
-        IntCodeError::IoError(err)
-    }
-}
-
-impl From<std::num::ParseIntError> for IntCodeError {
-    fn from(err: std::num::ParseIntError) -> Self {
-        IntCodeError::ParseError(err)
     }
 }
 
@@ -87,25 +134,9 @@ impl TryFrom<Value> for ParameterMode {
     }
 }
 
-impl OpCode {
-    fn num_args(&self) -> usize {
-        match self {
-            OpCode::Add(..) => 3,
-            OpCode::Multiply(..) => 3,
-            OpCode::Input(..) => 1,
-            OpCode::Output(..) => 1,
-            OpCode::JumpIfTrue(..) => 2,
-            OpCode::JumpIfFalse(..) => 2,
-            OpCode::LessThan(..) => 3,
-            OpCode::Equals(..) => 3,
-            OpCode::Exit => 0,
-        }
-    }
-}
-
-impl TryFrom<&Value> for OpCode {
+impl TryFrom<Value> for OpCode {
     type Error = IntCodeError;
-    fn try_from(value: &Value) -> Result<Self> {
+    fn try_from(value: Value) -> Result<Self> {
         let modes = value / 100;
         macro_rules! params {
             (1) => {
@@ -128,253 +159,173 @@ impl TryFrom<&Value> for OpCode {
             7 => Ok(OpCode::LessThan(params!(1), params!(2), params!(3))),
             8 => Ok(OpCode::Equals(params!(1), params!(2), params!(3))),
             99 => Ok(OpCode::Exit),
-            _ => Err(IntCodeError::InvalidOpCode(*value)),
+            _ => Err(IntCodeError::InvalidOpCode(value)),
         }
     }
 }
 
-struct Parameter {
-    mode: ParameterMode,
-    value: Value,
+#[derive(Clone)]
+pub enum IntCodeMachineState {
+    InputRequired,
+    Running,
+    Finished,
 }
 
-impl Parameter {
-    fn get(&self, arr: &[Value]) -> Result<Value> {
-        match self.mode {
-            ParameterMode::Immediate => Ok(self.value),
+#[derive(Clone)]
+pub struct IntCodeMachine {
+    memory: Vec<Value>,
+    instruction_pointer: usize,
+    state: IntCodeMachineState,
+}
+
+impl IntCodeMachine {
+    pub fn new(memory: Vec<Value>) -> Self {
+        Self {
+            memory,
+            instruction_pointer: 0,
+            state: IntCodeMachineState::InputRequired,
+        }
+    }
+
+    fn read_op_code(&mut self) -> Result<OpCode> {
+        let op_code = self.memory[self.instruction_pointer].try_into()?;
+        self.instruction_pointer += 1;
+        Ok(op_code)
+    }
+
+    fn read_parameter(&mut self, mode: ParameterMode) -> Result<Value> {
+        let current = self.memory[self.instruction_pointer];
+        self.instruction_pointer += 1;
+        Ok(match mode {
+            ParameterMode::Immediate => current,
             ParameterMode::Reference => {
-                let address: usize = self.value.try_into()?;
-                Ok(arr[address])
+                let addr: usize = current.try_into()?;
+                self.memory[addr]
+            }
+        })
+    }
+
+    fn read_address(&mut self, mode: ParameterMode) -> Result<usize> {
+        let current = self.memory[self.instruction_pointer];
+        self.instruction_pointer += 1;
+        match mode {
+            ParameterMode::Reference => Ok(current.try_into()?),
+            ParameterMode::Immediate => Err(IntCodeError::ImmediateModeOutput),
+        }
+    }
+
+    fn execute_command(
+        &mut self,
+        code: OpCode,
+        input: &mut Vec<Value>,
+        output: &mut Vec<Value>,
+    ) -> Result<()> {
+        match code {
+            OpCode::Exit => {
+                self.state = IntCodeMachineState::Finished;
+            }
+            OpCode::Add(m1, m2, m3) => {
+                let x = self.read_parameter(m1)?;
+                let y = self.read_parameter(m2)?;
+                let addr = self.read_address(m3)?;
+                self.memory[addr] = x + y;
+            }
+            OpCode::Multiply(m1, m2, m3) => {
+                let x = self.read_parameter(m1)?;
+                let y = self.read_parameter(m2)?;
+                let addr = self.read_address(m3)?;
+                self.memory[addr] = x * y;
+            }
+            OpCode::Input(mode) => {
+                if input.is_empty() {
+                    self.state = IntCodeMachineState::InputRequired;
+                    self.instruction_pointer -= 1;
+                } else {
+                    let value = input.remove(0);
+                    let addr = self.read_address(mode)?;
+                    self.memory[addr] = value;
+                }
+            }
+            OpCode::Output(mode) => {
+                let value = self.read_parameter(mode)?;
+                output.push(value);
+            }
+            OpCode::LessThan(m1, m2, m3) => {
+                let x = self.read_parameter(m1)?;
+                let y = self.read_parameter(m2)?;
+                let addr = self.read_address(m3)?;
+                if x < y {
+                    self.memory[addr] = 1;
+                } else {
+                    self.memory[addr] = 0;
+                }
+            }
+            OpCode::Equals(m1, m2, m3) => {
+                let x = self.read_parameter(m1)?;
+                let y = self.read_parameter(m2)?;
+                let addr = self.read_address(m3)?;
+                if x == y {
+                    self.memory[addr] = 1;
+                } else {
+                    self.memory[addr] = 0;
+                }
+            }
+            OpCode::JumpIfTrue(m1, m2) => {
+                let cond = self.read_parameter(m1)?;
+                let addr = self.read_parameter(m2)?;
+                if cond != 0 {
+                    self.instruction_pointer = addr.try_into()?;
+                }
+            }
+            OpCode::JumpIfFalse(m1, m2) => {
+                let cond = self.read_parameter(m1)?;
+                let addr = self.read_parameter(m2)?;
+                if cond == 0 {
+                    self.instruction_pointer = addr.try_into()?;
+                }
             }
         }
-    }
-
-    fn set(&self, value: Value, arr: &mut [Value]) -> Result<()> {
-        if let ParameterMode::Immediate = self.mode {
-            return Err(IntCodeError::ImmediateModeOutput);
-        }
-        let address: usize = self.value.try_into()?;
-        arr[address] = value;
         Ok(())
     }
-}
 
-enum Command {
-    Add(Parameter, Parameter, Parameter),
-    Multiply(Parameter, Parameter, Parameter),
-    Input(Parameter),
-    Output(Parameter),
-    JumpIfTrue(Parameter, Parameter),
-    JumpIfFalse(Parameter, Parameter),
-    LessThan(Parameter, Parameter, Parameter),
-    Equals(Parameter, Parameter, Parameter),
-    Stop,
-}
-
-impl Command {
-    fn from_op_code<'a, I>(op: OpCode, iterator: &mut I) -> Result<Command>
-    where
-        I: Iterator<Item = &'a Value>,
-    {
-        let len = op.num_args();
-        let args = Command::read_args(iterator, len)?;
-        let command = match op {
-            OpCode::Add(m1, m2, m3) => Command::Add(
-                Parameter {
-                    mode: m1,
-                    value: args[0],
-                },
-                Parameter {
-                    mode: m2,
-                    value: args[1],
-                },
-                Parameter {
-                    mode: m3,
-                    value: args[2],
-                },
-            ),
-            OpCode::Multiply(m1, m2, m3) => Command::Multiply(
-                Parameter {
-                    mode: m1,
-                    value: args[0],
-                },
-                Parameter {
-                    mode: m2,
-                    value: args[1],
-                },
-                Parameter {
-                    mode: m3,
-                    value: args[2],
-                },
-            ),
-            OpCode::Input(m1) => Command::Input(Parameter {
-                mode: m1,
-                value: args[0],
-            }),
-            OpCode::Output(m1) => Command::Output(Parameter {
-                mode: m1,
-                value: args[0],
-            }),
-            OpCode::JumpIfTrue(m1, m2) => Command::JumpIfTrue(
-                Parameter {
-                    mode: m1,
-                    value: args[0],
-                },
-                Parameter {
-                    mode: m2,
-                    value: args[1],
-                },
-            ),
-            OpCode::JumpIfFalse(m1, m2) => Command::JumpIfFalse(
-                Parameter {
-                    mode: m1,
-                    value: args[0],
-                },
-                Parameter {
-                    mode: m2,
-                    value: args[1],
-                },
-            ),
-            OpCode::LessThan(m1, m2, m3) => Command::LessThan(
-                Parameter {
-                    mode: m1,
-                    value: args[0],
-                },
-                Parameter {
-                    mode: m2,
-                    value: args[1],
-                },
-                Parameter {
-                    mode: m3,
-                    value: args[2],
-                },
-            ),
-            OpCode::Equals(m1, m2, m3) => Command::Equals(
-                Parameter {
-                    mode: m1,
-                    value: args[0],
-                },
-                Parameter {
-                    mode: m2,
-                    value: args[1],
-                },
-                Parameter {
-                    mode: m3,
-                    value: args[2],
-                },
-            ),
-            OpCode::Exit => Command::Stop,
-        };
-        Ok(command)
-    }
-
-    fn read_next<'a, I>(iterator: &mut I) -> Result<&'a Value>
-    where
-        I: Iterator<Item = &'a Value>,
-    {
-        iterator.next().ok_or(IntCodeError::UnexpectedEndOfFile)
-    }
-
-    fn read_args<'a, I>(iterator: &mut I, num: usize) -> Result<Vec<Value>>
-    where
-        I: Iterator<Item = &'a Value>,
-    {
-        let values = iterator.take(num).cloned().collect::<Vec<Value>>();
-
-        if values.len() < num {
-            Err(IntCodeError::UnexpectedEndOfFile)
-        } else {
-            Ok(values)
+    pub fn execute(&mut self, mut input: Vec<Value>) -> Result<Vec<Value>> {
+        let mut output = Vec::new();
+        let length = self.memory.len();
+        self.state = IntCodeMachineState::Running;
+        while let IntCodeMachineState::Running = self.state {
+            if self.instruction_pointer > length {
+                return Err(IntCodeError::UnexpectedEndOfFile);
+            }
+            let code = self.read_op_code()?;
+            self.execute_command(code, &mut input, &mut output)?;
         }
+        Ok(output)
     }
 
-    pub fn read_command<'a, I>(iterator: &mut I) -> Result<(usize, Command)>
-    where
-        I: Iterator<Item = &'a Value>,
-    {
-        let op_code: OpCode = Command::read_next(iterator)?.try_into()?;
-        let num_args = op_code.num_args();
-        let command = Command::from_op_code(op_code, iterator)?;
-        Ok((num_args + 1, command))
-    }
-
-    pub fn execute<In, Out>(
-        &self,
-        memory: &mut [Value],
-        mut input: In,
-        mut output: Out,
-    ) -> Result<Option<usize>>
-    where
-        In: BufRead,
-        Out: Write,
-    {
-        match self {
-            Command::Stop => return Ok(None),
-            Command::Add(x, y, result) => {
-                result.set(x.get(memory)? + y.get(memory)?, memory)?;
-            }
-            Command::Multiply(x, y, result) => {
-                result.set(x.get(memory)? * y.get(memory)?, memory)?;
-            }
-            Command::Input(address) => {
-                let mut line = String::new();
-                input.read_line(&mut line)?;
-                let value: Value = line.trim().parse()?;
-                address.set(value, memory)?;
-            }
-            Command::Output(address) => {
-                write!(output, "{}\n", address.get(memory)?)?;
-            }
-            Command::LessThan(x, y, result) => {
-                if x.get(memory)? < y.get(memory)? {
-                    result.set(1, memory)?;
-                } else {
-                    result.set(0, memory)?;
-                }
-            }
-            Command::Equals(x, y, result) => {
-                if x.get(memory)? == y.get(memory)? {
-                    result.set(1, memory)?;
-                } else {
-                    result.set(0, memory)?;
-                }
-            }
-            Command::JumpIfTrue(cond, address) => {
-                if cond.get(memory)? != 0 {
-                    return Ok(Some(address.get(memory)?.try_into()?));
-                }
-            }
-            Command::JumpIfFalse(cond, address) => {
-                if cond.get(memory)? == 0 {
-                    return Ok(Some(address.get(memory)?.try_into()?));
-                }
-            }
-        }
-        Ok(None)
+    pub fn memory(&self) -> &[Value] {
+        &self.memory
     }
 }
 
-pub fn run_intcode<In, Out>(memory: &mut [Value], mut input: In, mut output: Out) -> Result<Out>
-where
-    In: BufRead,
-    Out: Write,
-{
-    let mut instruction_pointer: usize = 0;
-    let length = memory.len();
-    loop {
-        if instruction_pointer > length {
-            return Err(IntCodeError::UnexpectedEndOfFile);
+impl Machine for IntCodeMachine {
+    fn execute(&mut self, mut input: Vec<Value>) -> Result<Vec<Value>> {
+        let mut output = Vec::new();
+        let length = self.memory.len();
+        self.state = IntCodeMachineState::Running;
+        while let IntCodeMachineState::Running = self.state {
+            if self.instruction_pointer > length {
+                return Err(IntCodeError::UnexpectedEndOfFile);
+            }
+            let code = self.read_op_code()?;
+            self.execute_command(code, &mut input, &mut output)?;
         }
-        let (advance, command) =
-            Command::read_command(&mut memory[instruction_pointer..].into_iter())?;
-        if let Command::Stop = command {
-            return Ok(output);
-        }
+        Ok(output)
+    }
 
-        if let Some(jump) = command.execute(memory, &mut input, &mut output)? {
-            instruction_pointer = jump;
-        } else {
-            instruction_pointer += advance;
+    fn finished(&self) -> bool {
+        match self.state {
+            IntCodeMachineState::Finished => true,
+            _ => false,
         }
     }
 }
@@ -388,7 +339,7 @@ where
 
     let parsed_values: Result<Vec<_>, _> = buffer
         .trim()
-        .split(",")
+        .split(',')
         .map(|value| value.parse::<Value>())
         .collect();
     Ok(parsed_values?)
@@ -396,76 +347,62 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::run_intcode;
-    use std::io::{BufReader, Cursor};
+    use super::IntCodeMachine;
 
     #[test]
     fn test_case_1() {
-        let buffer: &[u8] = &[];
-        let mut input = vec![1, 0, 0, 0, 99];
-        run_intcode(&mut input, BufReader::new(buffer), Cursor::new(vec![]))
-            .expect("Expect to work");
-        assert_eq!(input[..], [2, 0, 0, 0, 99]);
+        let mut machine = IntCodeMachine::new(vec![1, 0, 0, 0, 99]);
+        machine.execute(vec![]).expect("Expect to work");
+        assert_eq!(machine.memory(), [2, 0, 0, 0, 99]);
     }
 
     #[test]
     fn test_case_2() {
-        let buffer: &[u8] = &[];
-        let mut input = vec![2, 3, 0, 3, 99];
-        run_intcode(&mut input, BufReader::new(buffer), Cursor::new(vec![]))
-            .expect("Expect to work");
-        assert_eq!(input[..], [2, 3, 0, 6, 99]);
+        let mut machine = IntCodeMachine::new(vec![2, 3, 0, 3, 99]);
+        machine.execute(vec![]).expect("Expect to work");
+        assert_eq!(machine.memory(), [2, 3, 0, 6, 99]);
     }
 
     #[test]
     fn test_case_3() {
-        let buffer: &[u8] = &[];
-        let mut input = vec![2, 4, 4, 5, 99, 0];
-        run_intcode(&mut input, BufReader::new(buffer), Cursor::new(vec![]))
-            .expect("Expect to work");
-        assert_eq!(input[..], [2, 4, 4, 5, 99, 9801]);
+        let mut machine = IntCodeMachine::new(vec![2, 4, 4, 5, 99, 0]);
+        machine.execute(vec![]).expect("Expect to work");
+        assert_eq!(machine.memory(), [2, 4, 4, 5, 99, 9801]);
     }
 
     #[test]
     fn test_case_4() {
-        let buffer: &[u8] = &[];
-        let mut input = vec![1, 1, 1, 4, 99, 5, 6, 0, 99];
-        run_intcode(&mut input, BufReader::new(buffer), Cursor::new(vec![]))
-            .expect("Expect to work");
-        assert_eq!(input[..], [30, 1, 1, 4, 2, 5, 6, 0, 99]);
+        let mut machine = IntCodeMachine::new(vec![1, 1, 1, 4, 99, 5, 6, 0, 99]);
+        machine.execute(vec![]).expect("Expect to work");
+        assert_eq!(machine.memory(), [30, 1, 1, 4, 2, 5, 6, 0, 99]);
     }
 
     #[test]
     fn test_case_5() {
-        let buffer: &[u8] = &[];
-        let mut input = vec![1002, 4, 3, 4, 33];
-        run_intcode(&mut input, BufReader::new(buffer), Cursor::new(vec![]))
-            .expect("Expect to work");
-        assert_eq!(input[..], [1002, 4, 3, 4, 99]);
+        let mut machine = IntCodeMachine::new(vec![1002, 4, 3, 4, 33]);
+        machine.execute(vec![]).expect("Expect to work");
+        assert_eq!(machine.memory(), [1002, 4, 3, 4, 99]);
     }
     #[test]
     fn test_case_6() {
-        let buffer: &[u8] = b"99";
-        let mut input = vec![3, 2, 0];
-        run_intcode(&mut input, BufReader::new(buffer), Cursor::new(vec![]))
-            .expect("Expect to work");
-        assert_eq!(input[..], [3, 2, 99]);
+        let mut machine = IntCodeMachine::new(vec![3, 2, 0]);
+        machine.execute(vec![99]).expect("Expect to work");
+        assert_eq!(machine.memory(), [3, 2, 99]);
     }
     #[test]
     fn test_case_7() {
-        let buffer: &[u8] = b"0";
-        let mut input = vec![3, 12, 6, 12, 15, 1, 13, 14, 13, 4, 13, 99, -1, 0, 1, 9];
-        let output = run_intcode(&mut input, BufReader::new(buffer), Cursor::new(vec![]))
-            .expect("Expect to work");
-        assert_eq!(&output.into_inner()[..], "0\n".as_bytes())
+        let mut machine = IntCodeMachine::new(vec![
+            3, 12, 6, 12, 15, 1, 13, 14, 13, 4, 13, 99, -1, 0, 1, 9,
+        ]);
+        let output = machine.execute(vec![0]).expect("Expect to work");
+        assert_eq!(output, [0]);
     }
 
     #[test]
     fn test_case_8() {
-        let buffer: &[u8] = b"0";
-        let mut input = vec![3, 3, 1105, -1, 9, 1101, 0, 0, 12, 4, 12, 99, 1];
-        let output = run_intcode(&mut input, BufReader::new(buffer), Cursor::new(vec![]))
-            .expect("Expect to work");
-        assert_eq!(&output.into_inner()[..], "0\n".as_bytes())
+        let mut machine =
+            IntCodeMachine::new(vec![3, 3, 1105, -1, 9, 1101, 0, 0, 12, 4, 12, 99, 1]);
+        let output = machine.execute(vec![0]).expect("Expect to work");
+        assert_eq!(output, [0]);
     }
 }
